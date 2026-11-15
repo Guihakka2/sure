@@ -4,7 +4,7 @@ class CreateHoldingLotDisposals < ActiveRecord::Migration[8.1]
       t.references :account, null: false, type: :uuid, foreign_key: { on_delete: :cascade }
       t.references :sale_entry, null: false, type: :uuid, foreign_key: { to_table: :entries, on_delete: :cascade }
       # The trade that acquired the lot consumed; nil for the opening lot and
-      # for units sold beyond what was held.
+      # for units sold beyond what was held until an acquisition covers them.
       # Indexed: entries delete with :nullify must find matching disposals per
       # destroyed entry.
       t.references :lot_source_entry, type: :uuid, foreign_key: { to_table: :entries, on_delete: :nullify }
