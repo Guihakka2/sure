@@ -31,6 +31,17 @@ class HoldingLotDisposalTest < ActiveSupport::TestCase
     assert_equal 0, book.open_qty
   end
 
+  test "under fifo a purchase covers a transfer out's shortfall before a later sale's" do
+    book = Holding::LotBook.new(method: "fifo")
+    book.apply(nil, -4)
+    book.apply(nil, -6, source_id: "sale")
+
+    book.apply(BigDecimal("20"), 5, source_id: "cover")
+
+    assert_equal [ [ nil, 5, nil ], [ "cover", 1, 20 ] ],
+      book.disposals.map { |d| [ d.lot_source_id, d.qty, d.unit_cost ] }
+  end
+
   test "under average the book records no disposals" do
     book = Holding::LotBook.new
     book.apply(BigDecimal("12"), 60, source_id: "first")
@@ -464,6 +475,103 @@ class HoldingLotDisposalTest < ActiveSupport::TestCase
     end
   end
 
+  # A same-day round trip from a flat position, with the sale entered before
+  # the purchase. Entry order stands, so the sale runs short, and the purchase
+  # that covers it prices it.
+  test "under fifo a sale entered ahead of the day's purchase is priced at that purchase" do
+    travel_to TODAY do
+      gains = %w[average fifo].map do |method|
+        setup_account(method: method)
+        security = priced_security("FIFD#{method[0]}", 30)
+        sale = trade(security, -10, 250, 5)
+        buy = trade(security, 10, 200, 5)
+        entered_in_order(sale, buy)
+        materialize(:forward)
+        gain(sale)
+      end
+
+      assert_equal [ 500, 500 ], gains, "the fifo sale is covered by the day's 10 at $200"
+    end
+  end
+
+  test "under fifo a short sale covered on a later day is measured against that cover" do
+    travel_to TODAY do
+      setup_account(method: "fifo")
+      security = priced_security("FIFL", 30)
+      lot = trade(security, 5, 100, 2)
+      sale = trade(security, -15, 220, 3)
+      cover = trade(security, 10, 250, 7)
+      materialize(:forward)
+
+      assert_equal 3300 - (5 * 100 + 10 * 250), gain(sale), "5 from the lot at $100, 10 covered at $250"
+      assert_equal [ [ lot.id, 5, 100 ], [ cover.id, 10, 250 ] ].sort_by(&:last),
+        HoldingLotDisposal.where(sale_entry: sale).pluck(:lot_source_entry_id, :qty, :unit_cost)
+          .map { |id, qty, cost| [ id, qty.to_i, cost.to_i ] }.sort_by(&:last)
+    end
+  end
+
+  # Under average a sale entered ahead of the same day's purchase, from a flat
+  # position, must not leave that purchase in the pool once the position is
+  # back to zero, or the next purchase averages against it.
+  test "under average a same-day round trip entered sale first leaves no cost behind" do
+    travel_to TODAY do
+      setup_account
+      security = priced_security("AVGD", 30)
+      sale = trade(security, -10, 250, 5)
+      buy = trade(security, 10, 200, 5)
+      entered_in_order(sale, buy)
+      trade(security, 10, 300, 6)
+      materialize(:forward)
+
+      assert_equal 300, @account.holdings.find_by!(security: security, date: d(6)).avg_cost.amount
+      assert_equal 500, gain(sale)
+    end
+  end
+
+  test "under fifo a day's purchase entered first replays as before" do
+    travel_to TODAY do
+      setup_account(method: "fifo")
+      security = priced_security("FIFE", 30)
+      buy = trade(security, 10, 200, 5)
+      sale = trade(security, -10, 250, 5)
+      entered_in_order(buy, sale)
+      materialize(:forward)
+
+      assert_equal 500, gain(sale)
+    end
+  end
+
+  # Older lots still come first: only what the sale could not take from them is
+  # left for a later purchase to cover.
+  test "under fifo a sale entered ahead of the day's purchase still takes the oldest lot" do
+    travel_to TODAY do
+      setup_account(method: "fifo")
+      security = priced_security("FIFO", 30)
+      trade(security, 10, 100, 2)
+      sale = trade(security, -10, 250, 5)
+      buy = trade(security, 10, 200, 5)
+      entered_in_order(sale, buy)
+      materialize(:forward)
+
+      assert_equal 1500, gain(sale), "10 x ($250 - $100)"
+      assert_equal [ [ 10, 200 ] ], @account.holding_lots.where(security: security).where("qty > 0").pluck(:qty, :unit_cost).map { |q, c| [ q.to_i, c.to_i ] }
+    end
+  end
+
+  # Sold short in the morning and covered at a higher price later the same day.
+  test "under fifo an intraday short sale is measured against the day's cover" do
+    travel_to TODAY do
+      setup_account(method: "fifo")
+      security = priced_security("FIFS", 30)
+      sale = trade(security, -10, 200, 5)
+      cover = trade(security, 10, 250, 5)
+      entered_in_order(sale, cover)
+      materialize(:forward)
+
+      assert_equal(-500, gain(sale))
+    end
+  end
+
   test "average account figures unchanged after the method column exists" do
     travel_to TODAY do
       setup_account
@@ -742,6 +850,12 @@ class HoldingLotDisposalTest < ActiveSupport::TestCase
       qty = 16 + pre_history
       @account.holdings.create!(security: @security, date: d(10), qty: qty, price: 30, amount: qty * 30, currency: "USD",
         account_provider: @account_provider)
+    end
+
+    # Under travel_to every entry shares one created_at; spread them out in the
+    # order given.
+    def entered_in_order(*entries)
+      entries.each_with_index { |entry, index| entry.update_columns(created_at: TODAY - (entries.size - index).minutes) }
     end
 
     def materialize(strategy)
